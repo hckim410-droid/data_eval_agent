@@ -1,0 +1,7 @@
+min_rows: 1000
+max_target_missing_rate: 0.05
+min_usable_features: 5
+max_duplicate_row_rate: 0.02
+classification_minority_rate_warn: 0.05
+classification_minority_rate_fail: 0.01
+high_cardinality_warn_threshold: 50
