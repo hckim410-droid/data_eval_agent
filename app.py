@@ -236,7 +236,7 @@ def render_csv_section(
 def render_training_sidebar() -> None:
     columns = _get_columns()
     with st.sidebar.form("training_readiness_form"):
-        task_type = st.selectbox("작업 유형", ["classification", "regression"])
+        task_type = st.selectbox("모델 유형", ["classification", "regression"])
 
         if columns:
             target_column = st.selectbox("타깃 컬럼", columns)
@@ -287,14 +287,65 @@ def render_placeholder_sidebar(objective_key: str) -> None:
         )
 
 
+def render_policy_sidebar(policy: dict) -> None:
+    policy_values = {
+        "min_rows": policy.get("min_rows", "-"),
+        "max_target_missing_rate": policy.get("max_target_missing_rate", "-"),
+        "min_usable_features": policy.get("min_usable_features", "-"),
+        "max_duplicate_row_rate": policy.get("max_duplicate_row_rate", "-"),
+        "classification_minority_rate_warn": policy.get(
+            "classification_minority_rate_warn", "-"
+        ),
+        "classification_minority_rate_fail": policy.get(
+            "classification_minority_rate_fail", "-"
+        ),
+        "high_cardinality_warn_threshold": policy.get(
+            "high_cardinality_warn_threshold", "-"
+        ),
+    }
+
+    policy_markup = """
+<style>
+.policy-item {{ display: flex; align-items: center; gap: 6px; margin: 2px 0; }}
+.policy-key {{ font-weight: 600; font-size: 0.85rem; }}
+.policy-value {{ font-size: 0.85rem; color: #4a4a4a; }}
+.policy-help {{ display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; border-radius: 50%; border: 1px solid #8a8a8a;
+  font-size: 11px; color: #5a5a5a; }}
+</style>
+<div class="policy-item"><span class="policy-key">min_rows</span>
+<span class="policy-value">{min_rows}</span>
+<span class="policy-value">최소 행 수</span></div>
+<div class="policy-item"><span class="policy-key">max_target_missing_rate</span>
+<span class="policy-value">{max_target_missing_rate}</span>
+<span class="policy-value">타깃 결측 비율 상한</span></div>
+<div class="policy-item"><span class="policy-key">min_usable_features</span>
+<span class="policy-value">{min_usable_features}</span>
+<span class="policy-value">사용 가능한 피처 최소 수</span></div>
+<div class="policy-item"><span class="policy-key">max_duplicate_row_rate</span>
+<span class="policy-value">{max_duplicate_row_rate}</span>
+<span class="policy-value">중복 행 비율 상한</span></div>
+<div class="policy-item"><span class="policy-key">classification_minority_rate_warn</span>
+<span class="policy-value">{classification_minority_rate_warn}</span>
+<span class="policy-value">소수 클래스 비율 경고 기준</span></div>
+<div class="policy-item"><span class="policy-key">classification_minority_rate_fail</span>
+<span class="policy-value">{classification_minority_rate_fail}</span>
+<span class="policy-value">소수 클래스 비율 실패 기준</span></div>
+<div class="policy-item"><span class="policy-key">high_cardinality_warn_threshold</span>
+<span class="policy-value">{high_cardinality_warn_threshold}</span>
+<span class="policy-value">범주형 고카디널리티 경고 기준</span></div>
+"""
+    st.sidebar.markdown(policy_markup.format_map(policy_values), unsafe_allow_html=True)
+
+
 def run_o1_training(policy: dict | None) -> None:
     st.sidebar.header("설정")
+    render_training_sidebar()
     if policy:
-        st.sidebar.subheader("정책 임계값")
-        st.sidebar.json(policy)
+        st.sidebar.subheader("검증 기준값")
+        render_policy_sidebar(policy)
     else:
         st.sidebar.error("정책을 로드할 수 없습니다.")
-    render_training_sidebar()
 
 
 def run_o2_evaluation() -> None:
