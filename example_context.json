@@ -1,0 +1,5 @@
+{
+  "customer_id": "8634-MPHTR",
+  "note": "Sample context JSON for agent automation readiness",
+  "hint": "If provided, this replaces the auto-generated ontology context."
+}
