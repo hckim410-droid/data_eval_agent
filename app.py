@@ -9,9 +9,9 @@ from core.llm_client import call_ollama_generate
 from core.policy import load_policy
 from core.profiler import build_profile_o1
 
-st.set_page_config(page_title="데이터 검증 Agent", layout="wide")
+st.set_page_config(page_title="AI 품질 검증 Agent", layout="wide")
 
-st.title("데이터 검증 Agent")
+st.title("AI 품질 검증 Agent")
 
 POLICY_PATH_O1 = "policies/o1_training_default.yaml"
 
