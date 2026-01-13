@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -150,6 +151,12 @@ if "profile_cache" not in st.session_state:
 
 if "report_cache" not in st.session_state:
     st.session_state["report_cache"] = {}
+
+
+def _is_cloud_runtime() -> bool:
+    return os.environ.get("STREAMLIT_RUNTIME_ENV") == "cloud" or os.environ.get(
+        "STREAMLIT_CLOUD"
+    ) == "true"
 
 
 def _get_columns() -> list[str]:
@@ -933,9 +940,16 @@ def render_agent_automation_page() -> None:
     with tabs[2]:
         st.subheader("Run & Compare")
         model = st.text_input("모델", value="llama3.1", key="o4_ollama_model")
+        default_url = os.environ.get("OLLAMA_URL")
+        if not default_url:
+            default_url = "" if _is_cloud_runtime() else "http://localhost:11434"
         url = st.text_input(
-            "Ollama URL", value="http://localhost:11434", key="o4_ollama_url"
+            "Ollama URL", value=default_url, key="o4_ollama_url"
         )
+        if _is_cloud_runtime() and not url:
+            st.info(
+                "Streamlit Cloud cannot reach localhost. Set a reachable Ollama URL (OLLAMA_URL)."
+            )
         options_text = st.text_area(
             "Options JSON (선택)", key="o4_ollama_options", height=100
         )
@@ -958,6 +972,18 @@ def render_agent_automation_page() -> None:
                 st.warning(f"필수 업로드 필요: {', '.join(checklist)}")
 
         if run_clicked:
+            if _is_cloud_runtime() and url.strip().startswith(
+                (
+                    "http://localhost",
+                    "http://127.0.0.1",
+                    "https://localhost",
+                    "https://127.0.0.1",
+                )
+            ):
+                st.error(
+                    "Streamlit Cloud cannot reach localhost. Set a reachable Ollama URL."
+                )
+                return
             options = None
             if options_text.strip():
                 try:
