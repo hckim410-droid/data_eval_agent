@@ -849,6 +849,11 @@ def render_avh_pipeline_section(settings: dict | None) -> None:
 """
     )
 
+    distance_history_df = prepared.get("distance_history_df", pd.DataFrame())
+    if isinstance(distance_history_df, pd.DataFrame) and not distance_history_df.empty:
+        with st.expander("2-2)최근 t vs t-1 거리 시계열 보기"):
+            st.dataframe(distance_history_df.tail(60), use_container_width=True)
+
     st.markdown("**2-2) t vs t-1 거리 Feature 벡터**")
     distance_df = prepared.get("distance_df", pd.DataFrame())
     if distance_df.empty:
@@ -888,11 +893,6 @@ def render_avh_pipeline_section(settings: dict | None) -> None:
 - `Skew`, `2-moment`, `3-moment`, `unique_ratio`, `complete_ratio`: latest(t) 분포 형태 요약
 """
         )
-        distance_history_df = prepared.get("distance_history_df", pd.DataFrame())
-        if isinstance(distance_history_df, pd.DataFrame) and not distance_history_df.empty:
-            with st.expander("최근 t vs t-1 거리 시계열 보기"):
-                st.dataframe(distance_history_df.tail(60), use_container_width=True)
-
     if st.button("3) Synthetic 이상치 생성", key="avh_synthetic_btn"):
         syn_df = generate_synthetic_anomalies(prepared)
         st.session_state["avh_synthetic_df"] = syn_df
