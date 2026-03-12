@@ -1,3 +1,4 @@
+﻿import io
 import json
 import os
 from datetime import datetime, timezone
@@ -9,10 +10,51 @@ from core.evaluator import evaluate_o1
 from core.llm_client import call_ollama_generate
 from core.policy import load_policy
 from core.profiler import build_profile_o1
+try:
+    from auto_validate_by_history.streamlit_runner import (
+        get_avh_evaluation_criteria,
+        run_auto_validate_by_history,
+    )
+except Exception:
+    get_avh_evaluation_criteria = None
+    run_auto_validate_by_history = None
+try:
+    from auto_validate_by_history.workflow import (
+        build_rule_candidates,
+        evaluate_ground_truth,
+        generate_synthetic_anomalies,
+        prepare_history,
+        select_rules_with_budget,
+    )
+except Exception:
+    build_rule_candidates = None
+    evaluate_ground_truth = None
+    generate_synthetic_anomalies = None
+    prepare_history = None
+    select_rules_with_budget = None
 
-st.set_page_config(page_title="AI 품질 검증 Agent", layout="wide")
+st.set_page_config(
+    page_title="데이터 품질 Agent",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.title("AI 품질 검증 Agent")
+st.title("데이터 품질 Agent")
+
+def _inject_global_font_css() -> None:
+    st.markdown(
+        """
+<style>
+html, body, [class*="css"], [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+  font-family: "Noto Sans KR", "Malgun Gothic", "Apple SD Gothic Neo", "Segoe UI", sans-serif !important;
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+_inject_global_font_css()
 
 POLICY_PATH_O1 = "policies/o1_training_default.yaml"
 
@@ -128,10 +170,8 @@ Keys/notes:
 """.strip()
 
 OBJECTIVES = [
-    {"key": "model_training_readiness", "label": "모델 학습 데이터 품질"},
-    {"key": "model_evaluation_readiness", "label": "모델 평가 데이터 품질"},
-    {"key": "deployment_serving_readiness", "label": "배포/서빙 Readiness"},
-    {"key": "agent_automation_readiness", "label": "Agent/Automation Readiness"},
+    {"key": "model_training_readiness", "label": "데이터 학습 품질"},
+    {"key": "agent_automation_readiness", "label": "온톨로지 DB 품질"},
 ]
 
 OBJECTIVE_LABELS = {item["key"]: item["label"] for item in OBJECTIVES}
@@ -139,6 +179,9 @@ OBJECTIVE_LABELS = {item["key"]: item["label"] for item in OBJECTIVES}
 AGENT_POC_FEATURES = [
     "온톨로지 데이터 평가 PoC",
 ]
+POC_PAGES = {
+    "온톨로지 데이터 평가 PoC": "ontology_data_eval",
+}
 
 if "objective" not in st.session_state:
     st.session_state["objective"] = None
@@ -166,10 +209,56 @@ def _get_columns() -> list[str]:
     return list(df.columns)
 
 
+def _to_streamlit_safe_df(df: pd.DataFrame) -> pd.DataFrame:
+    safe_df = df.copy()
+    for col in safe_df.columns:
+        series = safe_df[col]
+        if series.dtype != "object":
+            continue
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+        value_types = {type(value) for value in non_null}
+        if len(value_types) > 1:
+            safe_df[col] = series.map(lambda value: value if pd.isna(value) else str(value))
+    return safe_df
+
+
+def _highlight_current_value(df: pd.DataFrame):
+    if "current_value" not in df.columns:
+        return df
+    return df.style.set_properties(subset=["current_value"], **{"font-weight": "700"})
+
+
+def _build_distance_signal_summary(distance_df: pd.DataFrame) -> pd.DataFrame:
+    if distance_df.empty or "feature" not in distance_df.columns or "z_score" not in distance_df.columns:
+        return pd.DataFrame()
+    working = distance_df.copy()
+    working["abs_z_score"] = pd.to_numeric(working["z_score"], errors="coerce").abs()
+    working["current_value"] = pd.to_numeric(working["current_value"], errors="coerce")
+    working = working.dropna(subset=["abs_z_score"])
+    if working.empty:
+        return pd.DataFrame()
+    top = (
+        working.sort_values(["feature", "abs_z_score"], ascending=[True, False])
+        .groupby("feature", as_index=False)
+        .first()
+    )
+    return top[["feature", "metric", "current_value", "hist_mean", "hist_std", "z_score", "abs_z_score"]]
+
+
 def _save_settings(objective_key: str, settings: dict) -> None:
     st.session_state["objective_settings"][objective_key] = settings
     st.session_state["profile_cache"] = {}
     st.session_state["report_cache"] = {}
+    for key in (
+        "avh_pipeline",
+        "avh_synthetic_df",
+        "avh_rule_bundle",
+        "avh_eval_result",
+        "avh_selected_rules_df",
+    ):
+        st.session_state.pop(key, None)
 
 
 def _build_profile_context(
@@ -214,6 +303,58 @@ def _get_or_build_profile(
     return profile, error
 
 
+def _get_or_build_avh_profile(
+    objective_key: str, settings: dict, df: pd.DataFrame
+) -> tuple[dict | None, str | None]:
+    context = _build_profile_context(objective_key, settings, df)
+    cached = st.session_state.get("profile_cache", {})
+    if cached.get("context") == context and cached.get("mode") == "avh_direct":
+        return cached.get("data"), cached.get("error")
+
+    profile = None
+    error = None
+    if run_auto_validate_by_history is None:
+        error = (
+            "auto_validate_by_history.streamlit_runner.run_auto_validate_by_history "
+            "를 로드할 수 없습니다."
+        )
+    else:
+        try:
+            avh_summary = run_auto_validate_by_history(
+                df=df,
+                group_key=settings.get("group_key"),
+                time_col=settings.get("time_column"),
+                target_col=settings.get("target_column"),
+            )
+            profile = {
+                "dataset_meta": {
+                    "task_type": "Auto Validate by History",
+                    "total_rows": int(len(df)),
+                    "sampled_rows": int(len(df)),
+                    "sampled": False,
+                    "target_column": settings.get("target_column"),
+                    "group_key": settings.get("group_key"),
+                    "time_column": settings.get("time_column"),
+                },
+                "schema": [
+                    {"name": str(col), "dtype": str(dtype)}
+                    for col, dtype in df.dtypes.items()
+                ],
+                "columns_summary": {},
+                "target_summary": {"avh_summary": avh_summary},
+            }
+        except Exception as exc:
+            error = str(exc)
+
+    st.session_state["profile_cache"] = {
+        "context": context,
+        "mode": "avh_direct",
+        "data": profile,
+        "error": error,
+    }
+    return profile, error
+
+
 def _get_or_build_report(
     profile_context: dict, profile: dict, policy: dict
 ) -> tuple[dict | None, str | None]:
@@ -242,6 +383,35 @@ def _df_to_markdown(df: pd.DataFrame) -> str:
         return df.to_markdown(index=False)
     except Exception:
         return df.to_csv(index=False)
+
+
+def _read_csv_with_fallback(
+    uploaded_file,
+) -> tuple[pd.DataFrame | None, str | None, str | None]:
+    raw = uploaded_file.getvalue()
+    encodings = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
+    last_error = None
+    for encoding in encodings:
+        try:
+            df = pd.read_csv(io.BytesIO(raw), encoding=encoding)
+            return df, encoding, None
+        except Exception as exc:
+            last_error = str(exc)
+    return None, None, last_error
+
+
+def _decode_text_with_fallback(
+    uploaded_file,
+) -> tuple[str | None, str | None, str | None]:
+    raw = uploaded_file.getvalue()
+    encodings = ("utf-8-sig", "utf-8", "cp949", "euc-kr")
+    last_error = None
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding), encoding, None
+        except Exception as exc:
+            last_error = str(exc)
+    return None, None, last_error
 
 
 def _load_properties(value: object) -> dict:
@@ -489,6 +659,70 @@ Requirements:
     return prompt.strip()
 
 
+def _render_avh_profile(profile: dict) -> None:
+    target_summary = profile.get("target_summary", {})
+    avh = target_summary.get("avh_summary", {}) if isinstance(target_summary, dict) else {}
+    if not avh:
+        st.info("Auto Validate by History 결과가 없습니다.")
+        return
+
+    st.caption(f"engine: {avh.get('engine', '-')}")
+    if avh.get("error"):
+        st.error(f"AVH 실행 오류: {avh.get('error')}")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Rows", avh.get("total_rows", "-"))
+    c2.metric("Total Groups", avh.get("total_groups", "-"))
+    c3.metric("Usable Groups", avh.get("usable_history_groups", "-"))
+    c4.metric("History Ready Rate", avh.get("history_ready_rate", "-"))
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Avg History Length", avh.get("avg_history_length", "-"))
+    c6.metric("Median History Length", avh.get("median_history_length", "-"))
+    c7.metric("Monotonic Rate", avh.get("sequence_monotonic_rate", "-"))
+
+    c8, c9, c10, c11 = st.columns(4)
+    c8.metric("Datetime Parse Success", avh.get("datetime_parse_success_rate", "-"))
+    c9.metric("Group Size CV", avh.get("group_size_cv", "-"))
+    c10.metric("Dup (Group,Time) Rate", avh.get("duplicate_group_time_rate", "-"))
+    c11.metric("Non-monotonic Group Rate", avh.get("non_monotonic_group_rate", "-"))
+
+    c12, c13, c14 = st.columns(3)
+    c12.metric("Latest Step Null Share", avh.get("latest_step_null_share", "-"))
+    c13.metric("Numeric Shift Score", avh.get("numeric_shift_score", "-"))
+    c14.metric("Latest Step Groups", avh.get("latest_step_group_count", "-"))
+
+    top_delta = avh.get("top_numeric_delta") or {}
+    if top_delta:
+        st.markdown("**Top Numeric Delta**")
+        st.dataframe(
+            pd.DataFrame(
+                [{"column": k, "avg_abs_delta": v} for k, v in top_delta.items()]
+            ),
+            use_container_width=True,
+        )
+
+    shift_detail = avh.get("numeric_shift_by_feature") or {}
+    if shift_detail:
+        st.markdown("**Numeric Shift By Feature**")
+        st.dataframe(
+            pd.DataFrame(
+                [{"column": k, "shift_score": v} for k, v in shift_detail.items()]
+            ).sort_values("shift_score", ascending=False),
+            use_container_width=True,
+        )
+
+    if avh.get("target_last_step_change_rate") is not None:
+        st.metric(
+            "Target Last-step Change Rate",
+            avh.get("target_last_step_change_rate"),
+        )
+
+    with st.expander("AVH Raw JSON"):
+        st.json(avh)
+
+
 def render_objective_selector() -> None:
     st.subheader("목표를 선택하세요")
 
@@ -512,9 +746,347 @@ def render_current_settings(objective_key: str) -> None:
         st.info("아직 저장된 설정이 없습니다.")
 
 
+def render_avh_pipeline_section(settings: dict | None) -> None:
+    st.divider()
+    st.subheader("Auto Validate by History")
+    st.caption(
+        "1) 이력 업로드(30일+) -> 2) Feature 벡터 -> 3) Synthetic 이상치 -> "
+        "4) Budget 기반 규칙 조합 -> 5) 정답 업로드 -> 6) Precision/Recall -> 7) 시각화"
+    )
+
+    if prepare_history is None:
+        st.error("auto_validate_by_history.workflow 모듈을 로드할 수 없습니다.")
+        return
+
+    history_file = st.file_uploader(
+        "1) 이력 데이터 CSV 업로드 (동일 포맷, 최소 30일 이상)",
+        type=["csv"],
+        key="avh_history_csv",
+    )
+    if history_file is None:
+        st.info("이력 데이터를 업로드하면 단계별 평가를 진행할 수 있습니다.")
+        return
+
+    history_df, detected_encoding, read_error = _read_csv_with_fallback(history_file)
+    if history_df is None:
+        st.error(f"CSV를 읽는 데 실패했습니다: {read_error}")
+        return
+    if detected_encoding and detected_encoding not in ("utf-8-sig", "utf-8"):
+        st.info(f"CSV 인코딩을 `{detected_encoding}`로 감지해 로드했습니다.")
+    st.caption(f"이력 데이터: 행 {len(history_df)} | 열 {len(history_df.columns)}")
+    with st.expander("이력 데이터 미리보기 (상위 100행)"):
+        st.dataframe(history_df.head(100), use_container_width=True)
+
+    cols = list(history_df.columns)
+    default_group = settings.get("group_key") if settings else None
+    default_time = settings.get("time_column") if settings else None
+    group_idx = cols.index(default_group) if default_group in cols else 0
+    time_idx = cols.index(default_time) if default_time in cols else 0
+
+    c1, c2 = st.columns(2)
+    with c1:
+        selected_group = st.selectbox("그룹 키 컬럼", cols, index=group_idx, key="avh_group_col")
+    with c2:
+        selected_time = st.selectbox("시간 컬럼", cols, index=time_idx, key="avh_time_col")
+
+    if st.button("2) Feature 벡터 계산", key="avh_prepare_btn"):
+        prepared = prepare_history(history_df, selected_group, selected_time)
+        st.session_state["avh_pipeline"] = prepared
+        st.session_state.pop("avh_synthetic_df", None)
+        st.session_state.pop("avh_rule_bundle", None)
+        st.session_state.pop("avh_eval_result", None)
+        st.session_state.pop("avh_selected_rules_df", None)
+
+    prepared = st.session_state.get("avh_pipeline")
+    if not prepared:
+        return
+    if prepared.get("error"):
+        st.error(prepared["error"])
+        return
+
+    history_check = prepared.get("history_check", {})
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Unique Days", history_check.get("unique_days", "-"))
+    m2.metric("Required Days", history_check.get("required_min_days", 30))
+    m3.metric("History Ready", "YES" if history_check.get("history_ready") else "NO")
+    m4.metric("Datetime Parse Rate", history_check.get("parse_rate", "-"))
+    st.markdown(
+        """
+**지표 설명**
+
+- `Unique Days`: 이력 데이터의 고유 일자 수
+- `Required Days`: 최소 필요 일수
+- `History Ready`: 최소 이력 요건 충족 여부
+- `Datetime Parse Rate`: 시간 컬럼의 날짜 변환 성공 비율
+"""
+    )
+    if not history_check.get("history_ready"):
+        st.error("최소 30일 요건을 만족하지 않아 다음 단계(3~7)를 진행할 수 없습니다.")
+        return
+
+    st.markdown("**2-1) Feature 벡터(통계)**")
+    feature_df = prepared.get("feature_df", pd.DataFrame())
+    if feature_df.empty:
+        st.warning("Feature 벡터를 계산할 수 없습니다.")
+        return
+    st.dataframe(feature_df, use_container_width=True)
+    st.markdown(
+        """
+**항목 설명**
+
+- `mean`: 전체 이력 평균
+- `std`: 전체 이력 표준편차
+- `median`: 전체 이력 중앙값
+- `mad`: 중앙값 기준 절대편차의 중앙값. 이상치에 덜 민감한 변동성 지표
+- `p05` / `p95`: 하위 5%, 상위 95% 분위수
+- `latest_mean` / `latest_std`: 각 그룹 최신 시점 값의 평균 / 표준편차
+- `latest_prev_delta_mean`: 각 그룹의 최신값과 직전값 차이의 평균
+
+**선정 기준**
+
+- `group_key`, `time_col`을 제외한 수치형 컬럼만 대상
+- 평소 분포, 최신 상태, 최근 변화까지 함께 보기 위한 구성
+"""
+    )
+
+    st.markdown("**2-2) t vs t-1 거리 Feature 벡터**")
+    distance_df = prepared.get("distance_df", pd.DataFrame())
+    if distance_df.empty:
+        st.info("거리 벡터를 계산할 수 없습니다.")
+        distance_debug = prepared.get("distance_debug", {})
+        if distance_debug:
+            st.markdown("**확인 포인트**")
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Total Groups", distance_debug.get("total_groups", "-"))
+            d2.metric("Common t/t-1 Groups", distance_debug.get("common_group_count", "-"))
+            d3.metric("Eligible Features", distance_debug.get("eligible_feature_count", "-"))
+            per_feature = distance_debug.get("per_feature_valid_group_count", {})
+            if per_feature:
+                debug_df = pd.DataFrame(
+                    [
+                        {"feature": feature, "valid_group_count": count}
+                        for feature, count in per_feature.items()
+                    ]
+                ).sort_values(["valid_group_count", "feature"], ascending=[False, True])
+                st.markdown("각 수치형 컬럼이 t와 t-1 값을 모두 가진 그룹 수")
+                st.dataframe(debug_df, use_container_width=True)
+    else:
+        st.dataframe(_highlight_current_value(distance_df.head(60)), use_container_width=True)
+        st.markdown(
+            """
+**항목 설명**
+
+- 각 행은 `feature x metric` 조합입니다.
+- `current_value`는 가장 최근 day pair의 `t vs t-1` metric 값입니다.
+- `hist_mean`, `hist_std`는 그 이전 day pair들에서 같은 metric의 히스토리 평균 / 표준편차입니다.
+- `z_score`는 현재 값이 과거 히스토리 대비 얼마나 벗어났는지 보여줍니다.
+
+**주요 metric**
+
+- `EMD`, `JS_div`, `KL_div`, `KS_dist`, `Cohen_dist`: t와 t-1 분포 차이
+- `Min`, `Max`, `Mean`, `Median`, `Count`, `Sum`, `Range`: latest(t) 쪽 단일 통계
+- `Skew`, `2-moment`, `3-moment`, `unique_ratio`, `complete_ratio`: latest(t) 분포 형태 요약
+"""
+        )
+        distance_history_df = prepared.get("distance_history_df", pd.DataFrame())
+        if isinstance(distance_history_df, pd.DataFrame) and not distance_history_df.empty:
+            with st.expander("최근 t vs t-1 거리 시계열 보기"):
+                st.dataframe(distance_history_df.tail(60), use_container_width=True)
+
+    if st.button("3) Synthetic 이상치 생성", key="avh_synthetic_btn"):
+        syn_df = generate_synthetic_anomalies(prepared)
+        st.session_state["avh_synthetic_df"] = syn_df
+        st.session_state.pop("avh_rule_bundle", None)
+        st.session_state.pop("avh_eval_result", None)
+        st.session_state.pop("avh_selected_rules_df", None)
+
+    synthetic_df = st.session_state.get("avh_synthetic_df")
+    if synthetic_df is not None:
+        if synthetic_df.empty:
+            st.warning("Synthetic 이상치가 생성되지 않았습니다.")
+            return
+        st.markdown("**3) 생성된 Synthetic 이상치 샘플**")
+        st.caption("2-1의 baseline center/scale을 사용해 spike, drop, missing, mean_shift 유형의 synthetic anomaly를 생성합니다.")
+        st.caption(
+            f"행 {len(synthetic_df)} | 이상치 비율: "
+            f"{round(float(synthetic_df['__is_anomaly'].mean()), 4) if len(synthetic_df) else 0.0}"
+        )
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Synthetic Rows", int(len(synthetic_df)))
+        s2.metric("Anomaly Rows", int(synthetic_df["__is_anomaly"].sum()))
+        s3.metric("Normal Rows", int((synthetic_df["__is_anomaly"] == 0).sum()))
+        preview_cols = [
+            c
+            for c in ("__is_anomaly", "__anomaly_type", "__anomaly_feature")
+            if c in synthetic_df.columns
+        ]
+        ordered_cols = preview_cols + [c for c in synthetic_df.columns if c not in preview_cols]
+        st.dataframe(synthetic_df[ordered_cols].head(80), use_container_width=True)
+        if "__anomaly_type" in synthetic_df.columns:
+            type_counts = (
+                synthetic_df["__anomaly_type"].value_counts(dropna=False).rename_axis("anomaly_type").to_frame("count")
+            )
+            st.markdown("**3) Synthetic 유형 분포**")
+            st.dataframe(type_counts, use_container_width=True)
+
+        budget = st.number_input(
+            "4) Budget (작을수록 보수적, 클수록 공격적)",
+            min_value=0.0001,
+            max_value=0.5,
+            value=0.05,
+            step=0.01,
+            format="%.4f",
+            key="avh_budget",
+        )
+        if st.button("4) Budget 기반 규칙 조합 생성", key="avh_rule_btn"):
+            candidates = build_rule_candidates(prepared, synthetic_df)
+            bundle = select_rules_with_budget(
+                candidates=candidates,
+                y_true=synthetic_df["__is_anomaly"].astype(int),
+                budget=float(budget),
+            )
+            st.session_state["avh_rule_bundle"] = bundle
+            st.session_state["avh_selected_rules_df"] = bundle.get("selected_df", pd.DataFrame())
+            st.session_state.pop("avh_eval_result", None)
+
+    rule_bundle = st.session_state.get("avh_rule_bundle")
+    if rule_bundle:
+        st.markdown("**4) 선택된 적합 규칙 조합**")
+        selected_df = rule_bundle.get("selected_df", pd.DataFrame())
+        if selected_df.empty:
+            st.warning("현재 budget에서 선택 가능한 규칙이 없습니다. budget을 조금 키워보세요.")
+        else:
+            st.caption("선택된 규칙의 항목/임계치(threshold)는 좌측 사이드바의 Selected AVH Rules 섹션에 표시됩니다.")
+            st.dataframe(_to_streamlit_safe_df(selected_df), use_container_width=True)
+        metrics = rule_bundle.get("metrics", {})
+        if metrics:
+            r1, r2, r3 = st.columns(3)
+            r1.metric("Synthetic Precision", metrics.get("precision", "-"))
+            r2.metric("Synthetic Recall", metrics.get("recall", "-"))
+            r3.metric("Synthetic FPR", metrics.get("fpr", "-"))
+            st.caption("현재 규칙 조합이 synthetic anomaly를 얼마나 잘 잡는지 보는 중간 평가입니다.")
+
+        distance_signal_df = _build_distance_signal_summary(prepared.get("distance_df", pd.DataFrame()))
+        if not selected_df.empty and not distance_signal_df.empty:
+            selected_view = selected_df.copy()
+            if "feature" not in selected_view.columns and "column" in selected_view.columns:
+                selected_view = selected_view.rename(columns={"column": "feature"})
+            selected_view = selected_view.merge(distance_signal_df, on="feature", how="left")
+            selected_view = selected_view.rename(
+                columns={
+                    "metric": "top_distance_metric",
+                    "current_value": "distance_current",
+                    "hist_mean": "distance_hist_mean",
+                    "hist_std": "distance_hist_std",
+                    "z_score": "distance_z_score",
+                    "abs_z_score": "distance_abs_z_score",
+                }
+            )
+            if "feature" in selected_df.columns:
+                selected_view = selected_view.rename(columns={"feature": "column"})
+            st.markdown("**4) 선택 규칙과 최근 거리 신호 연결**")
+            st.caption("선택된 feature별로 2-2 단계의 가장 강한 히스토리 기반 거리 신호를 함께 보여줍니다.")
+            st.dataframe(_to_streamlit_safe_df(selected_view), use_container_width=True)
+
+        truth_file = st.file_uploader("5) 정답(라벨 포함) 데이터 CSV 업로드", type=["csv"], key="avh_truth_csv")
+        if truth_file is not None:
+            truth_df, truth_encoding, truth_error = _read_csv_with_fallback(truth_file)
+            if truth_df is None:
+                st.error(f"정답 CSV를 읽는 데 실패했습니다: {truth_error}")
+                return
+            if truth_encoding and truth_encoding not in ("utf-8-sig", "utf-8"):
+                st.info(f"정답 CSV 인코딩을 `{truth_encoding}`로 감지해 로드했습니다.")
+            st.caption(f"정답 데이터: 행 {len(truth_df)} | 열 {len(truth_df.columns)}")
+            with st.expander("정답 데이터 미리보기 (상위 100행)"):
+                st.dataframe(truth_df.head(100), use_container_width=True)
+            label_candidates = [
+                c
+                for c in truth_df.columns
+                if c.lower() in ("label", "is_anomaly", "anomaly_label", "target", "y")
+            ]
+            label_idx = truth_df.columns.get_loc(label_candidates[0]) if label_candidates else 0
+            label_col = st.selectbox(
+                "정답 라벨 컬럼(0/1)",
+                list(truth_df.columns),
+                index=label_idx,
+                key="avh_label_col",
+            )
+            if st.button("6) 선택 규칙으로 정답 데이터 평가", key="avh_eval_btn"):
+                eval_result = evaluate_ground_truth(
+                    df=truth_df,
+                    label_col=label_col,
+                    selected_rules=rule_bundle.get("selected", []),
+                    baseline_stats=prepared.get("baseline_stats", {}),
+                )
+                st.session_state["avh_eval_result"] = eval_result
+
+    eval_result = st.session_state.get("avh_eval_result")
+    if eval_result:
+        if eval_result.get("error"):
+            st.error(eval_result["error"])
+            return
+        st.markdown("**6) Precision / Recall 평가 결과**")
+        metrics = eval_result.get("metrics", {})
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Precision", metrics.get("precision", "-"))
+        e2.metric("Recall", metrics.get("recall", "-"))
+        e3.metric("TP", metrics.get("tp", "-"))
+        e4.metric("FP", metrics.get("fp", "-"))
+        st.caption("5)에서 업로드한 정답 라벨 기준으로, 4)에서 선택한 규칙 조합의 성능을 평가한 결과입니다.")
+
+        st.markdown("**7) 시각화**")
+        cm_df = pd.DataFrame(
+            {
+                "item": ["TP", "FP", "TN", "FN"],
+                "count": [
+                    int(metrics.get("tp", 0) or 0),
+                    int(metrics.get("fp", 0) or 0),
+                    int(metrics.get("tn", 0) or 0),
+                    int(metrics.get("fn", 0) or 0),
+                ],
+            }
+        ).set_index("item")
+        st.markdown("Confusion Matrix Count")
+        st.bar_chart(cm_df)
+
+        pr_df = pd.DataFrame(
+            {
+                "metric": ["precision", "recall"],
+                "value": [
+                    float(metrics.get("precision", 0.0) or 0.0),
+                    float(metrics.get("recall", 0.0) or 0.0),
+                ],
+            }
+        ).set_index("metric")
+        st.markdown("Precision / Recall")
+        st.bar_chart(pr_df)
+
+        distance_signal_df = _build_distance_signal_summary(prepared.get("distance_df", pd.DataFrame()))
+        if not distance_signal_df.empty:
+            top_signal_df = (
+                distance_signal_df.sort_values("abs_z_score", ascending=False)
+                .head(10)[["feature", "abs_z_score"]]
+                .set_index("feature")
+            )
+            st.markdown("Top Distance Signals")
+            st.bar_chart(top_signal_df)
+
+
 def render_csv_section(
     objective_key: str, settings: dict | None, policy: dict | None
 ) -> None:
+    if (
+        objective_key == "model_training_readiness"
+        and settings
+        and settings.get("task_type") == "Auto Validate by History"
+    ):
+        render_avh_pipeline_section(settings)
+        return
+
+    effective_policy = policy
+    if settings and settings.get("task_type") == "Auto Validate by History":
+        effective_policy = _load_avh_criteria()
+
     st.divider()
     if st.button("사내 데이터 불러오기 (Coming Soon)", key="internal_data_main"):
         st.info(
@@ -525,11 +1097,12 @@ def render_csv_section(
         st.info("계속하려면 CSV 파일을 업로드하세요.")
         return
 
-    try:
-        df = pd.read_csv(uploaded)
-    except Exception as exc:
-        st.error(f"CSV를 읽는 데 실패했습니다: {exc}")
+    df, detected_encoding, read_error = _read_csv_with_fallback(uploaded)
+    if df is None:
+        st.error(f"CSV를 읽는 데 실패했습니다: {read_error}")
         return
+    if detected_encoding and detected_encoding not in ("utf-8-sig", "utf-8"):
+        st.info(f"CSV 인코딩을 `{detected_encoding}`로 감지해 로드했습니다.")
 
     st.session_state["uploaded_df"] = df
     st.caption(f"행: {len(df)} | 열: {len(df.columns)}")
@@ -539,7 +1112,12 @@ def render_csv_section(
     profile_context = None
     if objective_key == "model_training_readiness" and settings:
         profile_context = _build_profile_context(objective_key, settings, df)
-        profile, profile_error = _get_or_build_profile(objective_key, settings, df)
+        if settings.get("task_type") == "Auto Validate by History":
+            profile, profile_error = _get_or_build_avh_profile(
+                objective_key, settings, df
+            )
+        else:
+            profile, profile_error = _get_or_build_profile(objective_key, settings, df)
 
     preview_tab, profile_tab, evaluation_tab, export_tab = st.tabs(
         ["미리보기", "프로파일", "평가", "내보내기"]
@@ -553,7 +1131,10 @@ def render_csv_section(
             elif profile_error:
                 st.error(f"프로파일 생성에 실패했습니다: {profile_error}")
             else:
-                st.json(profile)
+                if settings.get("task_type") == "Auto Validate by History":
+                    _render_avh_profile(profile)
+                else:
+                    st.json(profile)
         else:
             st.info("프로파일 화면은 준비 중입니다.")
     with evaluation_tab:
@@ -564,11 +1145,11 @@ def render_csv_section(
                 st.error(f"프로파일 생성에 실패했습니다: {profile_error}")
             elif profile is None:
                 st.info("프로파일을 생성할 수 없습니다.")
-            elif not policy:
+            elif not effective_policy:
                 st.info("정책을 로드할 수 없습니다.")
             else:
                 report, report_error = _get_or_build_report(
-                    profile_context, profile, policy
+                    profile_context, profile, effective_policy
                 )
                 if report_error:
                     st.error(f"평가에 실패했습니다: {report_error}")
@@ -590,6 +1171,10 @@ def render_csv_section(
                     checks = report.get("checks", [])
                     if checks:
                         st.dataframe(pd.DataFrame(checks), use_container_width=True)
+                    if settings.get("task_type") == "Auto Validate by History":
+                        st.divider()
+                        st.markdown("**Auto Validate by History Result**")
+                        _render_avh_profile(profile)
         else:
             st.info("평가 화면은 준비 중입니다.")
     with export_tab:
@@ -605,9 +1190,9 @@ def render_csv_section(
             else:
                 st.info("프로파일을 생성해야 다운로드할 수 있습니다.")
 
-            if policy and profile and profile_context:
+            if effective_policy and profile and profile_context:
                 report, report_error = _get_or_build_report(
-                    profile_context, profile, policy
+                    profile_context, profile, effective_policy
                 )
                 if report_error:
                     st.error(f"평가에 실패했습니다: {report_error}")
@@ -628,14 +1213,19 @@ def render_csv_section(
 def render_training_sidebar() -> None:
     columns = _get_columns()
     with st.sidebar.form("training_readiness_form"):
-        task_type = st.selectbox("모델 유형", ["classification", "regression"])
+        task_type = st.selectbox(
+            "모델 유형", ["classification", "regression", "QA Agent", "Auto Validate by History"]
+        )
+        target_column = None
 
         if columns:
-            target_column = st.selectbox("타깃 컬럼", columns)
+            if task_type != "Auto Validate by History":
+                target_column = st.selectbox("타깃 컬럼", columns)
             group_key = st.selectbox("그룹 키(선택)", ["(없음)"] + columns)
             time_column = st.selectbox("시간 컬럼(선택)", ["(없음)"] + columns)
         else:
-            target_column = st.text_input("타깃 컬럼")
+            if task_type != "Auto Validate by History":
+                target_column = st.text_input("타깃 컬럼")
             group_key = st.text_input("그룹 키(선택)")
             time_column = st.text_input("시간 컬럼(선택)")
 
@@ -652,16 +1242,19 @@ def render_training_sidebar() -> None:
         if time_column and time_column != "(없음)":
             resolved_time_column = time_column
 
+        settings_payload = {
+            "task_type": task_type,
+            "group_key": resolved_group_key,
+            "time_column": resolved_time_column,
+            "sampling_mode": sampling_mode,
+            "sample_n": int(sample_n),
+        }
+        if task_type != "Auto Validate by History":
+            settings_payload["target_column"] = target_column
+
         _save_settings(
             "model_training_readiness",
-            {
-                "task_type": task_type,
-                "target_column": target_column,
-                "group_key": resolved_group_key,
-                "time_column": resolved_time_column,
-                "sampling_mode": sampling_mode,
-                "sample_n": int(sample_n),
-            },
+            settings_payload,
         )
 
 
@@ -747,11 +1340,137 @@ def render_policy_sidebar(policy: dict) -> None:
     st.sidebar.markdown(policy_markup.format_map(policy_values), unsafe_allow_html=True)
 
 
+
+def _load_avh_criteria() -> dict:
+    default_criteria = {
+        "required_group_key": True,
+        "required_time_column": True,
+        "min_history_length_per_group": 3,
+        "datetime_parse_success_threshold": 0.9,
+        "min_usable_history_groups": 30,
+        "min_history_ready_rate": 0.7,
+        "max_group_size_cv": 2.5,
+        "max_duplicate_group_time_rate": 0.01,
+        "max_non_monotonic_group_rate": 0.05,
+        "max_null_share_in_latest_step": 0.2,
+        "max_numeric_shift_score": 4.0,
+        "max_target_flip_rate": 0.5,
+    }
+    if get_avh_evaluation_criteria is None:
+        return default_criteria
+    try:
+        criteria = get_avh_evaluation_criteria()
+        if isinstance(criteria, dict):
+            merged = dict(default_criteria)
+            merged.update(criteria)
+            return merged
+    except Exception:
+        pass
+    return default_criteria
+
+
+def render_avh_policy_sidebar() -> None:
+    criteria = _load_avh_criteria()
+    policy_values = {
+        "required_group_key": "required" if criteria.get("required_group_key") else "-",
+        "required_time_column": "required" if criteria.get("required_time_column") else "-",
+        "min_history_length_per_group": criteria.get("min_history_length_per_group", "-"),
+        "datetime_parse_success_threshold": criteria.get(
+            "datetime_parse_success_threshold", "-"
+        ),
+        "min_usable_history_groups": criteria.get("min_usable_history_groups", "-"),
+        "min_history_ready_rate": criteria.get("min_history_ready_rate", "-"),
+        "max_group_size_cv": criteria.get("max_group_size_cv", "-"),
+        "max_duplicate_group_time_rate": criteria.get("max_duplicate_group_time_rate", "-"),
+        "max_non_monotonic_group_rate": criteria.get("max_non_monotonic_group_rate", "-"),
+        "max_null_share_in_latest_step": criteria.get("max_null_share_in_latest_step", "-"),
+        "max_numeric_shift_score": criteria.get("max_numeric_shift_score", "-"),
+        "max_target_flip_rate": criteria.get("max_target_flip_rate", "-"),
+    }
+
+    policy_markup = """
+<style>
+.policy-card {{
+  border: 1px solid #e2e2e2;
+  background: #fafafa;
+  padding: 8px 10px;
+  border-radius: 10px;
+}}
+.policy-row {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  border-bottom: 1px dashed #dedede;
+}}
+.policy-row:last-child {{
+  border-bottom: none;
+}}
+.policy-name {{
+  font-weight: 600;
+  font-size: 0.88rem;
+  color: #2f2f2f;
+}}
+.policy-value {{
+  font-size: 0.92rem;
+  color: #111111;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}}
+</style>
+<div class="policy-card">
+<div class="policy-row"><span class="policy-name">required_group_key (그룹 키 필수)</span>
+<span class="policy-value">{required_group_key}</span></div>
+<div class="policy-row"><span class="policy-name">required_time_column (시간 컬럼 필수)</span>
+<span class="policy-value">{required_time_column}</span></div>
+<div class="policy-row"><span class="policy-name">min_history_length_per_group (그룹별 최소 이력 길이)</span>
+<span class="policy-value">{min_history_length_per_group}</span></div>
+<div class="policy-row"><span class="policy-name">datetime_parse_success_threshold (날짜 파싱 성공률 기준)</span>
+<span class="policy-value">{datetime_parse_success_threshold}</span></div>
+<div class="policy-row"><span class="policy-name">min_usable_history_groups (사용 가능한 이력 그룹 최소 수)</span>
+<span class="policy-value">{min_usable_history_groups}</span></div>
+<div class="policy-row"><span class="policy-name">min_history_ready_rate (이력 준비율 최소 기준)</span>
+<span class="policy-value">{min_history_ready_rate}</span></div>
+<div class="policy-row"><span class="policy-name">max_group_size_cv (그룹 크기 변동계수 상한)</span>
+<span class="policy-value">{max_group_size_cv}</span></div>
+<div class="policy-row"><span class="policy-name">max_duplicate_group_time_rate (그룹-시간 중복 비율 상한)</span>
+<span class="policy-value">{max_duplicate_group_time_rate}</span></div>
+<div class="policy-row"><span class="policy-name">max_non_monotonic_group_rate (비단조 그룹 비율 상한)</span>
+<span class="policy-value">{max_non_monotonic_group_rate}</span></div>
+<div class="policy-row"><span class="policy-name">max_null_share_in_latest_step (최신 시점 결측 비율 상한)</span>
+<span class="policy-value">{max_null_share_in_latest_step}</span></div>
+<div class="policy-row"><span class="policy-name">max_numeric_shift_score (수치형 변화 점수 상한)</span>
+<span class="policy-value">{max_numeric_shift_score}</span></div>
+<div class="policy-row"><span class="policy-name">max_target_flip_rate (타깃 반전 비율 상한)</span>
+<span class="policy-value">{max_target_flip_rate}</span></div>
+</div>
+"""
+    st.sidebar.markdown("**AVH Policy Criteria**")
+    st.sidebar.markdown(policy_markup.format_map(policy_values), unsafe_allow_html=True)
+    selected_rules_df = st.session_state.get("avh_selected_rules_df")
+    if isinstance(selected_rules_df, pd.DataFrame) and not selected_rules_df.empty:
+        st.sidebar.markdown("**Selected AVH Rules**")
+        cols = [c for c in ["column", "rule_type", "threshold"] if c in selected_rules_df.columns]
+        st.sidebar.dataframe(
+            _to_streamlit_safe_df(selected_rules_df[cols]),
+            use_container_width=True,
+            height=180,
+        )
+
+
 def run_o1_training(policy: dict | None) -> None:
     st.sidebar.header("설정")
     render_training_sidebar()
-    if policy:
-        st.sidebar.subheader("검증 기준값")
+    current_settings = st.session_state["objective_settings"].get(
+        "model_training_readiness", {}
+    )
+    task_type = current_settings.get("task_type")
+
+    if task_type == "Auto Validate by History":
+        render_avh_policy_sidebar()
+    elif policy:
+        st.sidebar.subheader("Validation Criteria")
         render_policy_sidebar(policy)
     else:
         st.sidebar.error("정책을 로드할 수 없습니다.")
@@ -767,11 +1486,36 @@ def run_o3_deployment() -> None:
     render_placeholder_sidebar("deployment_serving_readiness")
 
 
-def run_o4_agent() -> None:
-    st.sidebar.button("기능", key="o4_feature_button")
+def run_o4_agent() -> list[str]:
     st.sidebar.markdown("PoC 리스트")
-    for item in AGENT_POC_FEATURES:
-        st.sidebar.markdown(f"- {item}")
+    selected = st.sidebar.multiselect(
+        "PoC 선택",
+        options=AGENT_POC_FEATURES,
+        default=AGENT_POC_FEATURES[:1],
+        key="o4_poc_selection",
+    )
+    if not selected:
+        st.sidebar.info("PoC를 선택하면 해당 화면이 표시됩니다.")
+    return selected
+
+
+def render_selected_poc_pages(selected: list[str]) -> None:
+    if not selected:
+        st.info("왼쪽 PoC 리스트에서 항목을 선택하세요.")
+        return
+
+    for idx, poc in enumerate(selected):
+        if len(selected) > 1:
+            st.subheader(poc)
+
+        page_key = POC_PAGES.get(poc)
+        if page_key == "ontology_data_eval":
+            render_agent_automation_page()
+        else:
+            st.warning("해당 PoC 화면은 준비되지 않았습니다.")
+
+        if idx < len(selected) - 1:
+            st.divider()
 
 
 def render_agent_automation_page() -> None:
@@ -795,7 +1539,7 @@ def render_agent_automation_page() -> None:
             "General DB mode: Table CSV required."
         )
 
-        st.subheader("Ontology 입력")
+        st.subheader("목표를 선택하세요")
         nodes_file = st.file_uploader(
             "Nodes CSV", type=["csv"], key="o4_nodes_csv"
         )
@@ -815,20 +1559,35 @@ def render_agent_automation_page() -> None:
             st.error("Edges CSV 업로드가 필요합니다.")
 
         if nodes_file is not None:
-            nodes_df = pd.read_csv(nodes_file)
+            nodes_df, nodes_encoding, nodes_error = _read_csv_with_fallback(nodes_file)
+            if nodes_df is None:
+                st.error(f"Nodes CSV를 읽는 데 실패했습니다: {nodes_error}")
+                return
             st.session_state["o4_nodes_df"] = nodes_df
-            st.caption(f"Nodes: {len(nodes_df)} rows × {len(nodes_df.columns)} cols")
+            st.caption(f"Nodes: {len(nodes_df)} rows x {len(nodes_df.columns)} cols")
+            if nodes_encoding and nodes_encoding not in ("utf-8-sig", "utf-8"):
+                st.info(f"Nodes CSV 인코딩 `{nodes_encoding}`으로 로드했습니다.")
             st.dataframe(nodes_df.head(10), use_container_width=True)
 
         if edges_file is not None:
-            edges_df = pd.read_csv(edges_file)
+            edges_df, edges_encoding, edges_error = _read_csv_with_fallback(edges_file)
+            if edges_df is None:
+                st.error(f"Edges CSV를 읽는 데 실패했습니다: {edges_error}")
+                return
             st.session_state["o4_edges_df"] = edges_df
-            st.caption(f"Edges: {len(edges_df)} rows × {len(edges_df.columns)} cols")
+            st.caption(f"Edges: {len(edges_df)} rows x {len(edges_df.columns)} cols")
+            if edges_encoding and edges_encoding not in ("utf-8-sig", "utf-8"):
+                st.info(f"Edges CSV 인코딩 `{edges_encoding}`으로 로드했습니다.")
             st.dataframe(edges_df.head(10), use_container_width=True)
 
         context_raw = None
         if context_file is not None:
-            context_raw = context_file.read().decode("utf-8")
+            context_raw, context_encoding, context_error = _decode_text_with_fallback(context_file)
+            if context_raw is None:
+                st.error(f"Context JSON을 읽는 데 실패했습니다: {context_error}")
+                return
+            if context_encoding and context_encoding not in ("utf-8-sig", "utf-8"):
+                st.info(f"Context JSON 인코딩 `{context_encoding}`으로 로드했습니다.")
         elif context_text:
             context_raw = context_text
         if context_raw is not None:
@@ -842,16 +1601,21 @@ def render_agent_automation_page() -> None:
                 st.warning("Context JSON이 유효하지 않습니다. 자동 컨텍스트로 대체됩니다.")
 
         st.divider()
-        st.subheader("General DB 입력")
+        st.subheader("목표를 선택하세요")
         table_file = st.file_uploader(
             "Table CSV", type=["csv"], key="o4_table_csv"
         )
         if table_file is None:
             st.error("Table CSV 업로드가 필요합니다.")
         else:
-            table_df = pd.read_csv(table_file)
+            table_df, table_encoding, table_error = _read_csv_with_fallback(table_file)
+            if table_df is None:
+                st.error(f"Table CSV를 읽는 데 실패했습니다: {table_error}")
+                return
             st.session_state["o4_table_df"] = table_df
-            st.caption(f"Table: {len(table_df)} rows × {len(table_df.columns)} cols")
+            st.caption(f"Table: {len(table_df)} rows x {len(table_df.columns)} cols")
+            if table_encoding and table_encoding not in ("utf-8-sig", "utf-8"):
+                st.info(f"Table CSV 인코딩 `{table_encoding}`으로 로드했습니다.")
             st.dataframe(table_df.head(10), use_container_width=True)
 
         if nodes_file is not None and edges_file is not None:
@@ -863,7 +1627,7 @@ def render_agent_automation_page() -> None:
             )
             st.session_state["o4_nodes_filtered_df"] = filtered_nodes
             st.session_state["o4_edges_filtered_df"] = filtered_edges
-            st.subheader("Ontology Context Preview")
+            st.subheader("목표를 선택하세요")
             ontology_context = _build_ontology_context_markdown(
                 filtered_nodes, filtered_edges
             )
@@ -879,7 +1643,7 @@ def render_agent_automation_page() -> None:
                 st.session_state["o4_table_df"], customer_id
             )
             st.session_state["o4_table_filtered_df"] = filtered_table
-            st.subheader("General Table Context Preview")
+            st.subheader("목표를 선택하세요")
             table_context = _df_to_markdown(filtered_table.head(200))
             st.text_area(
                 "Table Context",
@@ -892,7 +1656,7 @@ def render_agent_automation_page() -> None:
             nodes_file is not None and edges_file is not None and table_file is not None
         )
     with tabs[1]:
-        st.subheader("Prompt 입력")
+        st.subheader("목표를 선택하세요")
         question = st.text_area("Question", key="o4_question", height=100)
         customer_id = st.session_state.get("o4_customer_id") or "(not specified)"
 
@@ -938,7 +1702,7 @@ def render_agent_automation_page() -> None:
                 key="o4_prompt_preview_table",
             )
     with tabs[2]:
-        st.subheader("Run & Compare")
+        st.subheader("목표를 선택하세요")
         model = st.text_input("모델", value="llama3.1", key="o4_ollama_model")
         default_url = os.environ.get("OLLAMA_URL")
         if not default_url:
@@ -1113,7 +1877,7 @@ def render_agent_automation_page() -> None:
                 format_func=lambda i: labels[i],
             )
             run = options[selected]
-            st.subheader("Run Details")
+            st.subheader("목표를 선택하세요")
             st.json(run)
 
             if st.button("Load this run settings", key="o4_load_run"):
@@ -1161,7 +1925,10 @@ if objective_key:
     elif objective_key == "deployment_serving_readiness":
         run_o3_deployment()
     elif objective_key == "agent_automation_readiness":
-        render_agent_automation_page()
-        run_o4_agent()
+        selected_pocs = run_o4_agent()
+        render_selected_poc_pages(selected_pocs)
 else:
     render_objective_selector()
+
+
+
